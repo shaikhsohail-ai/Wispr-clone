@@ -798,6 +798,30 @@ kbd {
   }
 }
 
+@media (max-width: 600px) {
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .brand p {
+    display: none;
+  }
+
+  .stats {
+    gap: 6px;
+  }
+
+  .stat-value {
+    font-size: 16px;
+  }
+
+  .stat-label {
+    font-size: 10px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .mic-ring,
   .dot-live,

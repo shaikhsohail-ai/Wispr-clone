@@ -24,7 +24,7 @@ export function StatsBar({ version }: { version: number }) {
   const tiles = [
     { label: 'Dictations', value: stats ? String(stats.count) : '–', testId: 'stat-count' },
     { label: 'Words', value: stats ? stats.words.toLocaleString() : '–', testId: 'stat-words' },
-    { label: 'Avg speed', value: stats && stats.averageWpm > 0 ? `${Math.round(stats.averageWpm)} wpm` : '–', testId: 'stat-wpm' },
+    { label: 'Avg wpm', value: stats && stats.averageWpm > 0 ? String(Math.round(stats.averageWpm)) : '–', testId: 'stat-wpm' },
     { label: 'Time saved', value: stats ? formatDuration(stats.timeSavedMs) : '–', testId: 'stat-saved' },
   ];
 
