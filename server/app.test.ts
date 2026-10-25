@@ -1,0 +1,217 @@
+import request from 'supertest';
+import { describe, expect, it } from 'vitest';
+import { encodeWav } from '../src/shared/wav.js';
+import { createApp } from './app.js';
+import { loadConfig } from './config.js';
+import { createMockEngine } from './engines/mock.js';
+import type { Engine, EngineRegistry } from './engines/index.js';
+import { PolishError, type Polisher } from './polish.js';
+import { DictationStore } from './store.js';
+
+function wav(seconds: number, rate = 16_000): Buffer {
+  const samples = new Float32Array(Math.round(seconds * rate));
+  for (let i = 0; i < samples.length; i++) samples[i] = 0.3 * Math.sin(i / 10);
+  return Buffer.from(encodeWav(samples, rate));
+}
+
+async function build(overrides: { engines?: Engine[]; polisher?: Polisher; env?: NodeJS.ProcessEnv } = {}) {
+  const config = loadConfig({ WISPR_ENABLE_MOCK_ENGINE: '1', WISPR_MAX_AUDIO_SECONDS: '5', ...overrides.env }, '/nonexistent');
+  const store = await DictationStore.open(null);
+  const engines: EngineRegistry = new Map();
+  for (const engine of overrides.engines ?? [createMockEngine('mock words')]) engines.set(engine.id, engine);
+  const polisher: Polisher = overrides.polisher ?? {
+    enabled: false,
+    model: 'none',
+    polish: async () => {
+      throw new PolishError('AI polish is not configured', 503, 'polish_unavailable');
+    },
+  };
+  return { app: createApp({ config, store, engines, polisher, version: '1.2.3' }), store };
+}
+
+describe('GET /api/health', () => {
+  it('reports engine availability', async () => {
+    const { app } = await build();
+    const res = await request(app).get('/api/health');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, version: '1.2.3', engines: { mock: true, openai: false, local: false }, polish: false });
+  });
+});
+
+describe('POST /api/transcribe', () => {
+  it('transcribes a WAV upload with the chosen engine', async () => {
+    const { app } = await build();
+    const res = await request(app).post('/api/transcribe?engine=mock&language=en-GB').set('Content-Type', 'audio/wav').send(wav(1.5));
+    expect(res.status).toBe(200);
+    expect(res.body.text).toBe('mock words 1.5 seconds of audio received');
+    expect(res.body.engine).toBe('mock');
+    expect(res.body.language).toBe('en-GB');
+    expect(res.body.audioDurationMs).toBe(1500);
+    expect(typeof res.body.processingMs).toBe('number');
+  });
+
+  it('accepts application/octet-stream too', async () => {
+    const { app } = await build();
+    const res = await request(app).post('/api/transcribe?engine=mock').set('Content-Type', 'application/octet-stream').send(wav(1));
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects unknown, unavailable and misconfigured requests', async () => {
+    const unavailable: Engine = {
+      id: 'openai',
+      description: 'OpenAI',
+      available: () => false,
+      transcribe: async () => ({ text: '', language: 'en' }),
+    };
+    const { app } = await build({ engines: [createMockEngine('x'), unavailable] });
+    expect((await request(app).post('/api/transcribe?engine=nope').set('Content-Type', 'audio/wav').send(wav(1))).status).toBe(400);
+    const res503 = await request(app).post('/api/transcribe?engine=openai').set('Content-Type', 'audio/wav').send(wav(1));
+    expect(res503.status).toBe(503);
+    expect(res503.body.code).toBe('engine_unavailable');
+    expect(
+      (await request(app).post('/api/transcribe?engine=mock&language=bad!').set('Content-Type', 'audio/wav').send(wav(1))).status,
+    ).toBe(400);
+    const noBody = await request(app).post('/api/transcribe?engine=mock');
+    expect(noBody.status).toBe(400);
+    expect(noBody.body.error).toMatch(/audio\/wav/);
+    const garbage = await request(app).post('/api/transcribe?engine=mock').set('Content-Type', 'audio/wav').send(Buffer.from('hello'));
+    expect(garbage.status).toBe(400);
+    expect(garbage.body.error).toMatch(/Could not read the audio/);
+    const short = await request(app).post('/api/transcribe?engine=mock').set('Content-Type', 'audio/wav').send(wav(0.05));
+    expect(short.status).toBe(400);
+    expect(short.body.code).toBe('empty_audio');
+    const long = await request(app).post('/api/transcribe?engine=mock').set('Content-Type', 'audio/wav').send(wav(6));
+    expect(long.status).toBe(413);
+  });
+
+  it('maps engine failures to their status', async () => {
+    const failing: Engine = {
+      id: 'mock',
+      description: 'boom',
+      available: () => true,
+      transcribe: async () => {
+        throw new Error('kaboom');
+      },
+    };
+    const { app } = await build({ engines: [failing] });
+    const res = await request(app).post('/api/transcribe?engine=mock').set('Content-Type', 'audio/wav').send(wav(1));
+    expect(res.status).toBe(500);
+    expect(res.body.code).toBe('internal');
+  });
+
+  it('rejects uploads over the configured limit', async () => {
+    const { app } = await build({ env: { WISPR_MAX_UPLOAD_MB: '1' } });
+    const res = await request(app).post('/api/transcribe?engine=mock').set('Content-Type', 'audio/wav').send(wav(40));
+    expect(res.status).toBe(413);
+    expect(res.body.code).toBe('too_large');
+  });
+});
+
+describe('dictations API', () => {
+  it('supports create, list, search, get, patch, delete, clear, stats and export', async () => {
+    const { app } = await build();
+    const created = await request(app)
+      .post('/api/dictations')
+      .send({ text: 'Hello world.', rawText: 'hello world', engine: 'mock', language: 'en', durationMs: 2000 });
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({ text: 'Hello world.', rawText: 'hello world', wordCount: 2, polished: false });
+    const id = created.body.id as string;
+
+    await request(app).post('/api/dictations').send({ text: 'Second entry about cats', engine: 'webspeech', durationMs: 9000 });
+
+    const list = await request(app).get('/api/dictations');
+    expect(list.body.total).toBe(2);
+    expect(list.body.items[0].text).toBe('Second entry about cats');
+    const search = await request(app).get('/api/dictations?q=cats');
+    expect(search.body.items).toHaveLength(1);
+    expect(
+      (
+        await request(app)
+          .get('/api/dictations?limit=1')
+          .then((r) => r.body.items)
+      ).length,
+    ).toBe(1);
+
+    expect((await request(app).get(`/api/dictations/${id}`)).body.id).toBe(id);
+    expect((await request(app).get('/api/dictations/nope')).status).toBe(404);
+
+    const patched = await request(app).patch(`/api/dictations/${id}`).send({ text: 'Hello there, world.', polished: true });
+    expect(patched.status).toBe(200);
+    expect(patched.body.text).toBe('Hello there, world.');
+    expect(patched.body.polished).toBe(true);
+    expect(patched.body.wordCount).toBe(3);
+    expect((await request(app).patch(`/api/dictations/${id}`).send({})).status).toBe(400);
+    expect((await request(app).patch(`/api/dictations/${id}`).send({ text: '   ' })).status).toBe(400);
+    expect((await request(app).patch('/api/dictations/nope').send({ text: 'x' })).status).toBe(404);
+
+    const stats = await request(app).get('/api/stats');
+    expect(stats.body.count).toBe(2);
+    expect(stats.body.words).toBe(7);
+
+    const txt = await request(app).get('/api/dictations/export?format=txt');
+    expect(txt.status).toBe(200);
+    expect(txt.headers['content-disposition']).toMatch(/dictations-\d{4}-\d{2}-\d{2}\.txt/);
+    expect(txt.text).toContain('Hello there, world.');
+    const md = await request(app).get('/api/dictations/export?format=md');
+    expect(md.text.startsWith('# Dictations')).toBe(true);
+    const json = await request(app).get('/api/dictations/export?format=json');
+    expect(JSON.parse(json.text)).toHaveLength(2);
+    expect((await request(app).get('/api/dictations/export?format=xml')).status).toBe(400);
+
+    expect((await request(app).delete(`/api/dictations/${id}`)).status).toBe(204);
+    expect((await request(app).delete(`/api/dictations/${id}`)).status).toBe(404);
+    const cleared = await request(app).delete('/api/dictations');
+    expect(cleared.body.removed).toBe(1);
+    expect((await request(app).get('/api/stats')).body.count).toBe(0);
+  });
+
+  it('validates new dictations', async () => {
+    const { app } = await build();
+    expect((await request(app).post('/api/dictations').send({ text: '', engine: 'mock' })).status).toBe(400);
+    expect((await request(app).post('/api/dictations').send({ text: 'x', engine: 'nope' })).status).toBe(400);
+    expect((await request(app).post('/api/dictations').send({ text: 'x', engine: 'mock', language: '???' })).status).toBe(400);
+    expect((await request(app).post('/api/dictations').send('[1,2]')).status).toBe(400);
+    const bad = await request(app).post('/api/dictations').set('Content-Type', 'application/json').send('{oops');
+    expect(bad.status).toBe(400);
+    expect(bad.body.code).toBe('bad_json');
+  });
+});
+
+describe('POST /api/polish', () => {
+  it('returns 503 when AI polish is not configured', async () => {
+    const { app } = await build();
+    const res = await request(app).post('/api/polish').send({ text: 'hello', mode: 'clean' });
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('polish_unavailable');
+  });
+
+  it('passes validated requests to the polisher', async () => {
+    const calls: unknown[] = [];
+    const polisher: Polisher = {
+      enabled: true,
+      model: 'fake-model',
+      polish: async (req) => {
+        calls.push(req);
+        return { text: `polished: ${req.text}`, mode: req.mode, model: 'fake-model' };
+      },
+    };
+    const { app } = await build({ polisher });
+    const res = await request(app)
+      .post('/api/polish')
+      .send({ text: 'um hello', mode: 'formal', dictionary: [{ from: 'acme', to: 'ACME' }, { from: '', to: 'x' }, 'junk'] });
+    expect(res.status).toBe(200);
+    expect(res.body.text).toBe('polished: um hello');
+    expect(calls[0]).toEqual({ text: 'um hello', mode: 'formal', dictionary: [{ from: 'acme', to: 'ACME' }] });
+    expect((await request(app).post('/api/polish').send({ text: 'x', mode: 'shouty' })).status).toBe(400);
+    expect((await request(app).post('/api/polish').send({ mode: 'clean' })).status).toBe(400);
+  });
+});
+
+describe('misc', () => {
+  it('404s unknown API routes as JSON', async () => {
+    const { app } = await build();
+    const res = await request(app).get('/api/whatever');
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe('not_found');
+  });
+});
