@@ -45,6 +45,13 @@ async function main() {
     console.log(`  AI polish    : ${config.polishEnabled ? `enabled (${config.polishModel})` : 'disabled (set ANTHROPIC_API_KEY)'}`);
     if (config.enableMockEngine) console.log('  Mock engine  : enabled');
     if (config.allowedHosts.length) console.log(`  Allowed hosts: localhost, IP addresses, ${config.allowedHosts.join(', ')}`);
+    console.log(`  Password     : ${config.password ? `required (user "${config.username}")` : 'none'}`);
+    if (config.password && config.password.length < 8) console.warn('  WARNING: WISPR_PASSWORD is shorter than 8 characters');
+    if (!config.password && config.host !== '127.0.0.1' && config.host !== 'localhost' && config.host !== '::1') {
+      console.warn(
+        '  WARNING: listening on a non-loopback address without WISPR_PASSWORD; anyone who can reach this port can read and delete the history and use the API keys',
+      );
+    }
   });
 
   if (config.localPreload) {

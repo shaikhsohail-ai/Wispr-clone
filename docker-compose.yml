@@ -1,0 +1,42 @@
+# Run Wispr Clone on any machine with Docker:
+#   docker compose up -d --build                  -> http://localhost:8787 (microphone works on localhost)
+#   DOMAIN=dictate.example.com docker compose --profile https up -d --build
+#                                                  -> https://dictate.example.com with automatic certificates
+# Put secrets (WISPR_PASSWORD, OPENAI_API_KEY, ANTHROPIC_API_KEY) in a .env file next to this file.
+services:
+  wispr:
+    build: .
+    image: wispr-clone
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: '8787'
+      WISPR_DATA_DIR: /data
+    ports:
+      - '127.0.0.1:8787:8787'
+    volumes:
+      - wispr-data:/data
+
+  caddy:
+    image: caddy:2
+    profiles: ['https']
+    restart: unless-stopped
+    depends_on:
+      - wispr
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN to the host name that points at this machine}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  wispr-data:
+  caddy-data:
+  caddy-config:

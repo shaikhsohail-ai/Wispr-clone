@@ -6,6 +6,10 @@ export interface ServerConfig {
   host: string;
   /** Extra host names (lower-cased, `.example.com` matches subdomains) the API answers to; localhost and IP literals are always allowed. */
   allowedHosts: string[];
+  /** HTTP Basic auth user name; only used when `password` is set. */
+  username: string;
+  /** When set, every request except /api/health must carry these credentials. */
+  password: string | null;
   dataDir: string;
   dataFile: string;
   /** Directory with the built web app, or null to run API-only (dev mode behind Vite). */
@@ -46,6 +50,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
       .split(',')
       .map((h) => h.trim().toLowerCase())
       .filter(Boolean),
+    username: env.WISPR_USERNAME?.trim() || 'wispr',
+    password: env.WISPR_PASSWORD?.trim() ? env.WISPR_PASSWORD : null,
     dataDir,
     dataFile: resolve(dataDir, 'dictations.json'),
     staticDir,

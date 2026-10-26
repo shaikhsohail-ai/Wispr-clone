@@ -87,3 +87,11 @@ BROKEN LINE
     await rm(dir, { recursive: true, force: true });
   });
 });
+
+describe('password config', () => {
+  it('treats blank passwords as unset and keeps intentional characters', () => {
+    expect(loadConfig({ WISPR_PASSWORD: '   ' }, '/repo').password).toBeNull();
+    expect(loadConfig({ WISPR_PASSWORD: 'p@ss word!' }, '/repo').password).toBe('p@ss word!');
+    expect(loadConfig({ WISPR_PASSWORD: 'x', WISPR_USERNAME: ' me ' }, '/repo').username).toBe('me');
+  });
+});

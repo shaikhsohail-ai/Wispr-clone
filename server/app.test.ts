@@ -405,3 +405,63 @@ describe('misc', () => {
     expect(res.body.code).toBe('not_found');
   });
 });
+
+describe('password protection', () => {
+  const creds = (user: string, password: string) => `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
+
+  it('is off by default', async () => {
+    const { app } = await build();
+    expect((await request(app).get('/api/dictations')).status).toBe(200);
+  });
+
+  it('challenges every request except the health check when WISPR_PASSWORD is set', async () => {
+    const { app } = await build({ env: { WISPR_PASSWORD: 'hunter22' } });
+    const denied = await request(app).get('/api/dictations');
+    expect(denied.status).toBe(401);
+    expect(denied.headers['www-authenticate']).toMatch(/^Basic realm=/);
+    expect(denied.body.code).toBe('unauthorized');
+    expect((await request(app).get('/api/dictations').set('Authorization', creds('wispr', 'nope'))).status).toBe(401);
+    expect((await request(app).get('/api/dictations').set('Authorization', creds('someone', 'hunter22'))).status).toBe(401);
+    expect((await request(app).get('/api/dictations').set('Authorization', creds('wispr', 'hunter22'))).status).toBe(200);
+    expect((await request(app).get('/api/health')).status).toBe(200);
+    const mutation = await request(app).post('/api/dictations').send({ text: 'x', engine: 'mock' });
+    expect(mutation.status).toBe(401);
+  });
+
+  it('honours WISPR_USERNAME', async () => {
+    const { app } = await build({ env: { WISPR_PASSWORD: 'pw', WISPR_USERNAME: 'sohail' } });
+    expect((await request(app).get('/api/stats').set('Authorization', creds('wispr', 'pw'))).status).toBe(401);
+    expect((await request(app).get('/api/stats').set('Authorization', creds('sohail', 'pw'))).status).toBe(200);
+  });
+
+  it('accepts any host name once a password is set, but still refuses cross-site origins', async () => {
+    const { app } = await build({ env: { WISPR_PASSWORD: 'pw' } });
+    const auth = creds('wispr', 'pw');
+    const named = await request(app).get('/api/stats').set('Host', 'dictate.example.com').set('Authorization', auth);
+    expect(named.status).toBe(200);
+    const sameSite = await request(app)
+      .get('/api/stats')
+      .set('Host', 'dictate.example.com')
+      .set('Origin', 'https://dictate.example.com')
+      .set('Authorization', auth);
+    expect(sameSite.status).toBe(200);
+    const crossSite = await request(app)
+      .get('/api/stats')
+      .set('Host', 'dictate.example.com')
+      .set('Origin', 'https://evil.example')
+      .set('Authorization', auth);
+    expect(crossSite.status).toBe(403);
+    expect(crossSite.body.code).toBe('forbidden_origin');
+    const rebinding = await request(app).get('/api/stats').set('Host', 'evil.example').set('Origin', 'http://evil.example');
+    expect(rebinding.status).toBe(401);
+  });
+
+  it('without a password, a page served under an allowed name may call the API from that same name', async () => {
+    const { app } = await build({ env: { WISPR_ALLOWED_HOSTS: 'dictate.example.com' } });
+    const ok = await request(app).get('/api/stats').set('Host', 'dictate.example.com').set('Origin', 'https://dictate.example.com');
+    expect(ok.status).toBe(200);
+    const unknownHost = await request(app).get('/api/stats').set('Host', 'other.example.com');
+    expect(unknownHost.status).toBe(403);
+    expect(unknownHost.body.error).toMatch(/WISPR_PASSWORD or add it to WISPR_ALLOWED_HOSTS/);
+  });
+});

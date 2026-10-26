@@ -1,0 +1,22 @@
+# Render Blueprint: New -> Blueprint -> pick this repository. A persistent disk needs a paid instance.
+services:
+  - type: web
+    name: wispr-clone
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    disk:
+      name: wispr-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: WISPR_DATA_DIR
+        value: /data
+      - key: WISPR_PASSWORD
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false

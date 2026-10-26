@@ -12,6 +12,7 @@ import type {
   TranscribeResult,
 } from '../src/shared/types.js';
 import { decodeWav, type DecodedWav } from '../src/shared/wav.js';
+import { createBasicAuth } from './auth.js';
 import type { ServerConfig } from './config.js';
 import { ENGINE_IDS, EngineError, type EngineRegistry } from './engines/index.js';
 import { PolishError, type Polisher } from './polish.js';
@@ -141,11 +142,16 @@ function hostnameOf(value: string): string | null {
 
 /**
  * Only answer requests addressed to this machine (localhost, any IP literal or a name from WISPR_ALLOWED_HOSTS),
- * and only from pages served under such a name. A page elsewhere whose DNS name is re-pointed at 127.0.0.1
+ * and only from pages served under the same name. A page elsewhere whose DNS name is re-pointed at 127.0.0.1
  * (DNS rebinding) would otherwise read and wipe the history and spend the configured API keys; an attacker
  * has to use a DNS name, so IP literals stay open for LAN use with HOST=0.0.0.0.
+ *
+ * With a password configured the Host check is unnecessary (a rebinding page cannot present the credentials,
+ * which the browser only attaches for the origin that supplied them), so any host name is accepted and a
+ * deployment needs no host list. The Origin check stays: a cross-site page is refused even if it could
+ * somehow carry credentials.
  */
-function createHostGuard(allowedHosts: string[]) {
+function createHostGuard(allowedHosts: string[], passwordProtected: boolean) {
   const allowed = (hostname: string | null): boolean => {
     if (!hostname) return false;
     const name = hostname.toLowerCase();
@@ -155,12 +161,23 @@ function createHostGuard(allowedHosts: string[]) {
   };
   return (req: Request, _res: Response, next: NextFunction) => {
     const host = req.headers.host ?? '';
-    if (!allowed(hostnameOf(host))) {
-      return next(new HttpError(403, `Requests for host "${host}" are not accepted; add it to WISPR_ALLOWED_HOSTS`, 'forbidden_host'));
+    const hostName = hostnameOf(host);
+    if (!passwordProtected && !allowed(hostName)) {
+      return next(
+        new HttpError(
+          403,
+          `Requests for host "${host}" are not accepted; set WISPR_PASSWORD or add it to WISPR_ALLOWED_HOSTS`,
+          'forbidden_host',
+        ),
+      );
     }
     const origin = req.headers.origin;
-    if (origin !== undefined && !allowed(hostnameOf(origin))) {
-      return next(new HttpError(403, `Requests from origin "${origin}" are not accepted`, 'forbidden_origin'));
+    if (origin !== undefined) {
+      const originName = hostnameOf(origin);
+      const sameSite = originName !== null && hostName !== null && originName.toLowerCase() === hostName.toLowerCase();
+      if (!sameSite && !allowed(originName)) {
+        return next(new HttpError(403, `Requests from origin "${origin}" are not accepted`, 'forbidden_origin'));
+      }
     }
     next();
   };
@@ -172,8 +189,12 @@ export function createApp(deps: AppDeps): express.Express {
   app.disable('x-powered-by');
   app.set('etag', false);
 
+  if (config.password) {
+    app.use(createBasicAuth({ username: config.username, password: config.password, open: ['/api/health'] }));
+  }
+
   const api = express.Router();
-  api.use(createHostGuard(config.allowedHosts));
+  api.use(createHostGuard(config.allowedHosts, Boolean(config.password)));
   api.use(express.json({ limit: '2mb' }));
 
   api.get('/health', (_req, res) => {
