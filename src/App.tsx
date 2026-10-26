@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { HistoryPanel } from './components/HistoryPanel';
 import { MicButton } from './components/MicButton';
 import { SettingsPanel } from './components/SettingsPanel';
@@ -6,8 +6,9 @@ import { StatsBar } from './components/StatsBar';
 import { TranscriptPanel } from './components/TranscriptPanel';
 import { Toasts } from './components/Toasts';
 import { Waveform } from './components/Waveform';
-import { resolveEngine, useDictation } from './hooks/useDictation';
+import { isBusyPhase, resolveEngine, useDictation } from './hooks/useDictation';
 import { useToasts } from './hooks/useToasts';
+import { useTouchFirst } from './hooks/useTouchFirst';
 import { api } from './lib/api';
 import { copyText } from './lib/clipboard';
 import { hotkeyLabel, isEditableTarget, matchesHotkey } from './lib/hotkey';
@@ -23,9 +24,15 @@ export function App() {
   const [tab, setTab] = useState<Tab>('history');
   const [historyVersion, bumpHistory] = useReducer((n: number) => n + 1, 0);
   const { toasts, notify, dismiss } = useToasts();
+  const touchFirst = useTouchFirst();
 
   const dictation = useDictation({ settings, health, notify, onSaved: bumpHistory, onChanged: bumpHistory });
   const { phase, start, stop, toggle, cancel } = dictation;
+
+  /** The app handled the matching keydown, so its keyup is ours to act on (a plain Space on a control is not). */
+  const hotkeyHeld = useRef(false);
+  /** In hold mode the key went down while a run was still in flight; start as soon as it settles. */
+  const pendingHold = useRef(false);
 
   useEffect(() => {
     saveSettings(settings);
@@ -34,15 +41,22 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     let timer = 0;
+    let wasDown = false;
     const poll = async () => {
       try {
         const info = await api.health();
         if (cancelled) return;
         setHealth(info);
         setServerOnline(true);
+        if (wasDown) {
+          // The sidebar only refetches when the version changes; refresh it now that the server is back.
+          wasDown = false;
+          bumpHistory();
+        }
         timer = window.setTimeout(poll, 30_000);
       } catch {
         if (cancelled) return;
+        wasDown = true;
         setServerOnline(false);
         timer = window.setTimeout(poll, 4_000);
       }
@@ -58,25 +72,31 @@ export function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && (phase === 'listening' || phase === 'transcribing')) {
         event.preventDefault();
+        pendingHold.current = false;
         void cancel();
         return;
       }
       if (event.repeat || isEditableTarget(event.target)) return;
       if (!matchesHotkey(event, settings.hotkey, 'press')) return;
       event.preventDefault();
+      hotkeyHeld.current = true;
       if (settings.talkMode === 'hold') {
-        if (phase !== 'listening') void start();
+        if (isBusyPhase(phase)) pendingHold.current = true;
+        else if (phase !== 'listening') void start();
       } else {
         toggle();
       }
     };
     const onKeyUp = (event: KeyboardEvent) => {
-      if (!matchesHotkey(event, settings.hotkey, 'release')) return;
-      if (isEditableTarget(event.target) && phase !== 'listening') return;
+      if (!hotkeyHeld.current || !matchesHotkey(event, settings.hotkey, 'release')) return;
+      hotkeyHeld.current = false;
+      pendingHold.current = false;
       event.preventDefault();
       if (settings.talkMode === 'hold' && phase === 'listening') void stop();
     };
     const onBlur = () => {
+      hotkeyHeld.current = false;
+      pendingHold.current = false;
       if (settings.talkMode === 'hold' && phase === 'listening') void stop();
     };
     window.addEventListener('keydown', onKeyDown);
@@ -89,7 +109,21 @@ export function App() {
     };
   }, [phase, settings.hotkey, settings.talkMode, start, stop, toggle, cancel]);
 
+  // A hold that began while the previous dictation was still being processed starts once that run has settled.
+  useEffect(() => {
+    if (settings.talkMode !== 'hold' || !pendingHold.current) return;
+    if (phase === 'done' || phase === 'idle' || phase === 'error') {
+      pendingHold.current = false;
+      void start();
+    }
+  }, [phase, settings.talkMode, start]);
+
   const updateSettings = useCallback((patch: Partial<Settings>) => setSettings((s) => ({ ...s, ...patch })), []);
+
+  const resetSettings = useCallback(() => {
+    if (settings.dictionary.length > 0 && !window.confirm('Reset all settings and remove your personal dictionary?')) return;
+    setSettings({ ...DEFAULT_SETTINGS });
+  }, [settings.dictionary.length]);
 
   const copy = useCallback(
     async (text: string) => {
@@ -102,6 +136,39 @@ export function App() {
   const engine = resolveEngine(settings, health);
   const hotkey = hotkeyLabel(settings.hotkey);
   const listening = phase === 'listening';
+  const busy = isBusyPhase(phase);
+
+  const heroHint = busy
+    ? 'Working on it…'
+    : touchFirst
+      ? listening
+        ? settings.talkMode === 'hold'
+          ? 'Let go to finish'
+          : 'Tap again to finish'
+        : settings.talkMode === 'hold'
+          ? 'Hold the button to talk'
+          : 'Tap the button to start'
+      : listening
+        ? settings.talkMode === 'hold'
+          ? `Release ${hotkey} to finish`
+          : `Press ${hotkey} to finish`
+        : settings.talkMode === 'hold'
+          ? `Hold ${hotkey} to talk`
+          : `Press ${hotkey} to start`;
+
+  // One short announcement per phase change for screen readers; the live panel itself is not a live region.
+  const announcement =
+    phase === 'listening'
+      ? 'Listening'
+      : phase === 'transcribing'
+        ? 'Transcribing'
+        : phase === 'polishing'
+          ? 'Polishing with AI'
+          : phase === 'saving'
+            ? 'Saving'
+            : phase === 'done' && dictation.result
+              ? `Dictation ready, ${dictation.result.wordCount} words`
+              : '';
 
   return (
     <div className="app">
@@ -132,15 +199,10 @@ export function App() {
               onStop={() => void stop()}
               onToggle={toggle}
             />
-            <p className="hero-hint" aria-live="polite">
-              {listening
-                ? settings.talkMode === 'hold'
-                  ? `Release ${hotkey} to finish`
-                  : `Press ${hotkey} to finish`
-                : settings.talkMode === 'hold'
-                  ? `Hold ${hotkey} to talk`
-                  : `Press ${hotkey} to start`}
-            </p>
+            <p className="hero-hint">{heroHint}</p>
+            <span className="sr-only" role="status" data-testid="phase-status">
+              {announcement}
+            </span>
             <Waveform active={listening} getLevel={dictation.getLevel} />
           </div>
 
@@ -149,18 +211,23 @@ export function App() {
             interimText={dictation.interimText}
             result={dictation.result}
             error={dictation.error}
+            canRetry={dictation.canRetry}
             activeEngine={dictation.activeEngine}
             elapsedMs={dictation.elapsedMs}
             canPolish={Boolean(health?.polish)}
             polishMode={settings.polishMode}
             hotkeyLabel={hotkey}
             talkMode={settings.talkMode}
+            touchFirst={touchFirst}
             onPolishModeChange={(mode: PolishMode) => updateSettings({ polishMode: mode })}
-            onPolish={(mode) => void dictation.polishCurrent(mode)}
+            onPolish={(mode, text) => void dictation.polishCurrent(mode, text)}
             onSave={(text) => void dictation.saveEdit(text)}
+            onRetrySave={() => void dictation.retrySave()}
             onDelete={() => void dictation.deleteCurrent()}
             onCopy={(text) => void copy(text)}
             onNew={() => dictation.select(null)}
+            onCancel={() => void cancel()}
+            onRetry={() => void dictation.retry()}
             onDismissError={dictation.dismissError}
           />
         </section>
@@ -196,15 +263,11 @@ export function App() {
               onSelect={dictation.select}
               onCopy={(text) => void copy(text)}
               onChanged={bumpHistory}
+              onDeleted={dictation.discard}
               notify={notify}
             />
           ) : (
-            <SettingsPanel
-              settings={settings}
-              health={health}
-              onChange={updateSettings}
-              onReset={() => setSettings({ ...DEFAULT_SETTINGS })}
-            />
+            <SettingsPanel settings={settings} health={health} onChange={updateSettings} onReset={resetSettings} />
           )}
         </aside>
       </main>

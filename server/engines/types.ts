@@ -1,4 +1,7 @@
-import type { EngineId } from '../../src/shared/types.js';
+import { ENGINE_LABELS, type EngineId } from '../../src/shared/types.js';
+
+/** Every engine id the API accepts, derived from the shared label table so there is a single list. */
+export const ENGINE_IDS = Object.keys(ENGINE_LABELS) as EngineId[];
 
 export interface TranscribeInput {
   /** Complete WAV file as uploaded by the browser. */

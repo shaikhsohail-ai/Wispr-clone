@@ -10,12 +10,14 @@ interface Props {
   onSelect: (dictation: Dictation) => void;
   onCopy: (text: string) => void;
   onChanged: () => void;
+  /** A dictation (or, with no id, every dictation) was removed from the store; the editor may be showing it. */
+  onDeleted: (id?: string) => void;
   notify: (message: string, kind?: 'info' | 'success' | 'error') => void;
 }
 
 const PAGE = 50;
 
-export function HistoryPanel({ version, selectedId, onSelect, onCopy, onChanged, notify }: Props) {
+export function HistoryPanel({ version, selectedId, onSelect, onCopy, onChanged, onDeleted, notify }: Props) {
   const [query, setQuery] = useState('');
   const [debounced, setDebounced] = useState('');
   // One state object per fetch so "loading" is derived (key mismatch) instead of set from inside the effect.
@@ -59,10 +61,12 @@ export function HistoryPanel({ version, selectedId, onSelect, onCopy, onChanged,
   };
 
   const remove = async (id: string) => {
+    if (!window.confirm('Delete this dictation? This cannot be undone.')) return;
     try {
       await api.deleteDictation(id);
       setItems((list) => list.filter((d) => d.id !== id));
       setTotal((t) => Math.max(0, t - 1));
+      onDeleted(id);
       onChanged();
     } catch (err) {
       notify(`Could not delete: ${(err as Error).message}`, 'error');
@@ -74,6 +78,7 @@ export function HistoryPanel({ version, selectedId, onSelect, onCopy, onChanged,
     try {
       const { removed } = await api.clearDictations();
       notify(`Deleted ${removed} dictation${removed === 1 ? '' : 's'}`, 'success');
+      onDeleted();
       onChanged();
     } catch (err) {
       notify(`Could not clear history: ${(err as Error).message}`, 'error');

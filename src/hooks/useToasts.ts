@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react';
-import type { Toast, ToastKind } from '../components/Toasts';
+import type { Toast, ToastAction, ToastKind } from '../components/Toasts';
 
 export function useToasts() {
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -10,10 +10,11 @@ export function useToasts() {
   }, []);
 
   const notify = useCallback(
-    (message: string, kind: ToastKind = 'info') => {
+    (message: string, kind: ToastKind = 'info', action?: ToastAction) => {
       const id = nextId.current++;
-      setToasts((list) => [...list.slice(-3), { id, message, kind }]);
-      window.setTimeout(() => dismiss(id), kind === 'error' ? 7000 : 3500);
+      setToasts((list) => [...list.slice(-3), { id, message, kind, action }]);
+      // A toast with a button stays longer so the user has time to press it.
+      window.setTimeout(() => dismiss(id), action ? 10_000 : kind === 'error' ? 7000 : 3500);
     },
     [dismiss],
   );

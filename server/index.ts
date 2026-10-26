@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { createApp } from './app.js';
 import { loadConfig, loadDotEnv } from './config.js';
 import { createEngines } from './engines/index.js';
+import type { LocalEngine } from './engines/local.js';
 import { createPolisher } from './polish.js';
 import { DictationStore } from './store.js';
 
@@ -18,6 +19,9 @@ async function readVersion(): Promise<string> {
   return '0.0.0';
 }
 
+/** How long start-up waits for the local engine's import probe; a hung import must not block the server. */
+const LOCAL_PROBE_TIMEOUT_MS = 5_000;
+
 async function main() {
   loadDotEnv();
   const config = loadConfig();
@@ -27,19 +31,24 @@ async function main() {
   const polisher = createPolisher({ enabled: config.polishEnabled, model: config.polishModel });
   const app = createApp({ config, store, engines, polisher, version });
 
+  // Let the optional-dependency probe settle (a few ms when the package is missing, ~0.1-0.4 s when it is
+  // installed) so the banner and /api/health are accurate from the first request.
+  const local = engines.get('local') as LocalEngine | undefined;
+  if (local) await Promise.race([local.ready, new Promise<void>((r) => setTimeout(r, LOCAL_PROBE_TIMEOUT_MS).unref())]);
+
   const server = app.listen(config.port, config.host, () => {
     console.log(`Wispr Clone server listening on http://${config.host}:${config.port}`);
     console.log(`  history file : ${config.dataFile}`);
     console.log(`  web app      : ${config.staticDir ?? 'not built (run "npm run dev" for the Vite dev server, or "npm run build")'}`);
     console.log(`  OpenAI       : ${config.openaiApiKey ? `enabled (${config.openaiModel})` : 'disabled (set OPENAI_API_KEY)'}`);
-    console.log(`  Local Whisper: ${engines.get('local')?.available() ? `enabled (${config.localModel})` : 'unavailable'}`);
+    console.log(`  Local Whisper: ${local?.available() ? `enabled (${config.localModel})` : 'unavailable'}`);
     console.log(`  AI polish    : ${config.polishEnabled ? `enabled (${config.polishModel})` : 'disabled (set ANTHROPIC_API_KEY)'}`);
     if (config.enableMockEngine) console.log('  Mock engine  : enabled');
+    if (config.allowedHosts.length) console.log(`  Allowed hosts: localhost, IP addresses, ${config.allowedHosts.join(', ')}`);
   });
 
   if (config.localPreload) {
-    const local = engines.get('local') as { warmup?: () => Promise<void> } | undefined;
-    local?.warmup?.().catch((err: Error) => console.warn(`[local] preload failed: ${err.message}`));
+    local?.warmup().catch((err: Error) => console.warn(`[local] preload failed: ${err.message}`));
   }
 
   let shuttingDown = false;
@@ -48,10 +57,13 @@ async function main() {
     shuttingDown = true;
     console.log(`\n${signal} received, saving history and shutting down`);
     server.close();
-    store
-      .flush()
-      .catch((err) => console.error('[store] flush failed:', err))
-      .finally(() => process.exit(0));
+    store.flush().then(
+      () => process.exit(0),
+      (err: unknown) => {
+        console.error(`[store] dictation history was NOT saved to ${config.dataFile}:`, err);
+        process.exit(1);
+      },
+    );
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));

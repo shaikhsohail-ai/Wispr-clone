@@ -24,7 +24,14 @@ const TARGET_RATE = 16_000;
  * downloaded from the Hugging Face Hub on first use and cached under `cacheDir`; nothing is
  * sent anywhere afterwards.
  */
-export function createLocalEngine(options: LocalEngineOptions): Engine & { warmup(): Promise<void>; status(): LocalStatus } {
+export interface LocalEngine extends Engine {
+  /** Settles once the optional dependency has been probed, i.e. once `available()` is accurate. */
+  readonly ready: Promise<void>;
+  warmup(): Promise<void>;
+  status(): LocalStatus;
+}
+
+export function createLocalEngine(options: LocalEngineOptions): LocalEngine {
   let modulePromise: Promise<TransformersModule | null> | null = null;
   let pipelinePromise: Promise<AsrPipeline> | null = null;
   let status: LocalStatus = 'idle';
@@ -76,12 +83,14 @@ export function createLocalEngine(options: LocalEngineOptions): Engine & { warmu
     return pipelinePromise;
   };
 
-  // Probe importability eagerly so the health endpoint is accurate without loading the model.
-  void loadModule();
+  // Probe importability eagerly so the health endpoint is accurate without loading the model; the server
+  // awaits `ready` before listening so neither the banner nor /api/health can observe the pending state.
+  const ready = loadModule().then(() => undefined);
 
   return {
     id: 'local',
     description: `Local Whisper (${options.model})`,
+    ready,
     available: () => importable !== false,
     status: () => status,
     warmup: async () => {

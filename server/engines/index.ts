@@ -15,5 +15,5 @@ export function createEngines(config: ServerConfig): EngineRegistry {
   return engines;
 }
 
-export { EngineError } from './types.js';
+export { ENGINE_IDS, EngineError } from './types.js';
 export type { Engine, TranscribeInput, TranscribeOutput } from './types.js';

@@ -2,13 +2,20 @@ import { describe, expect, it } from 'vitest';
 import { encodeWav } from '../../src/shared/wav.js';
 import { createLocalEngine, type TransformersModule } from './local.js';
 
-function fakeModule(
-  record: { calls: Array<{ model: string; options: unknown; audioLength: number; generate: unknown }> },
-  text = 'local words',
-): TransformersModule {
+interface FakeRecord {
+  calls: Array<{ model: string; options: unknown; audioLength: number; generate: unknown }>;
+  /** How many times `pipeline()` built a model, as opposed to how many times the model was run. */
+  loads: number;
+}
+
+const newRecord = (): FakeRecord => ({ calls: [], loads: 0 });
+
+function fakeModule(record: FakeRecord, text = 'local words'): TransformersModule {
   return {
     env: {},
     pipeline: async (_task, model, options) => {
+      record.loads += 1;
+      await new Promise((r) => setTimeout(r, 1)); // overlapping callers genuinely race the in-flight load
       return async (audio: Float32Array, generate?: Record<string, unknown>) => {
         record.calls.push({ model, options, audioLength: audio.length, generate });
         return { text };
@@ -21,20 +28,23 @@ const wavBuffer = (seconds: number, rate: number) => Buffer.from(encodeWav(new F
 
 describe('local engine', () => {
   it('loads the pipeline once, resamples to 16 kHz and forwards the language', async () => {
-    const record = { calls: [] as Array<{ model: string; options: unknown; audioLength: number; generate: unknown }> };
+    const record = newRecord();
+    const mod = fakeModule(record);
     const engine = createLocalEngine({
       model: 'onnx-community/whisper-base',
       cacheDir: '/tmp/cache',
       dtype: 'q8',
-      loadTransformers: async () => fakeModule(record),
+      loadTransformers: async () => mod,
     });
-    await new Promise((r) => setTimeout(r, 0));
+    await engine.ready;
     expect(engine.available()).toBe(true);
     expect(engine.status()).toBe('idle');
     const out = await engine.transcribe({ wav: wavBuffer(1, 48_000), language: 'fr-FR', durationMs: 1000 });
     expect(out).toEqual({ text: 'local words', language: 'fr-FR' });
     expect(engine.status()).toBe('ready');
     await engine.transcribe({ wav: wavBuffer(0.5, 16_000), language: 'auto', durationMs: 500 });
+    expect(record.loads).toBe(1);
+    expect(mod.env.cacheDir).toBe('/tmp/cache');
     expect(record.calls).toHaveLength(2);
     expect(record.calls[0].audioLength).toBe(16_000);
     expect(record.calls[0].options).toEqual({ dtype: 'q8' });
@@ -42,8 +52,25 @@ describe('local engine', () => {
     expect(record.calls[1].generate).not.toHaveProperty('language');
   });
 
+  it('shares one pipeline load between overlapping requests and warm-up', async () => {
+    const record = newRecord();
+    const engine = createLocalEngine({ model: 'm', cacheDir: '/tmp/cache', loadTransformers: async () => fakeModule(record) });
+    await Promise.all([
+      engine.transcribe({ wav: wavBuffer(1, 16_000), language: 'auto', durationMs: 1000 }),
+      engine.transcribe({ wav: wavBuffer(1, 16_000), language: 'auto', durationMs: 1000 }),
+    ]);
+    expect(record.loads).toBe(1);
+    expect(record.calls).toHaveLength(2);
+
+    const preloaded = newRecord();
+    const other = createLocalEngine({ model: 'm', cacheDir: '/tmp/cache', loadTransformers: async () => fakeModule(preloaded) });
+    await Promise.all([other.warmup(), other.transcribe({ wav: wavBuffer(1, 16_000), language: 'auto', durationMs: 1000 })]);
+    expect(preloaded.loads).toBe(1);
+    expect(preloaded.calls).toHaveLength(1);
+  });
+
   it('never passes language to English-only models', async () => {
-    const record = { calls: [] as Array<{ model: string; options: unknown; audioLength: number; generate: unknown }> };
+    const record = newRecord();
     const engine = createLocalEngine({
       model: 'onnx-community/whisper-tiny.en',
       cacheDir: '/tmp/cache',
@@ -54,15 +81,16 @@ describe('local engine', () => {
     expect(record.calls[0].generate).not.toHaveProperty('task');
   });
 
-  it('reports unavailability when the optional dependency is missing', async () => {
+  it('reports unavailability once the import probe finds the optional dependency missing', async () => {
     const engine = createLocalEngine({
       model: 'm',
       cacheDir: '/tmp/cache',
       loadTransformers: async () => {
+        await new Promise((r) => setTimeout(r, 5)); // a slow failure, as with a broken native binding
         throw new Error("Cannot find package '@huggingface/transformers'");
       },
     });
-    await new Promise((r) => setTimeout(r, 0));
+    await engine.ready;
     expect(engine.available()).toBe(false);
     await expect(engine.transcribe({ wav: wavBuffer(1, 16_000), language: 'auto', durationMs: 1000 })).rejects.toMatchObject({
       status: 503,

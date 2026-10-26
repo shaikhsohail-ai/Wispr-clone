@@ -4,6 +4,8 @@ import { resolve } from 'node:path';
 export interface ServerConfig {
   port: number;
   host: string;
+  /** Extra host names (lower-cased, `.example.com` matches subdomains) the API answers to; localhost and IP literals are always allowed. */
+  allowedHosts: string[];
   dataDir: string;
   dataFile: string;
   /** Directory with the built web app, or null to run API-only (dev mode behind Vite). */
@@ -40,6 +42,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
   return {
     port: intEnv(env.PORT, 8787),
     host: env.HOST || '127.0.0.1',
+    allowedHosts: (env.WISPR_ALLOWED_HOSTS ?? '')
+      .split(',')
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean),
     dataDir,
     dataFile: resolve(dataDir, 'dictations.json'),
     staticDir,

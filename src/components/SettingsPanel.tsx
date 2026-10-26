@@ -143,6 +143,10 @@ export function SettingsPanel({ settings, health, onChange, onReset }: Props) {
           />
           <span>Copy each dictation to the clipboard</span>
         </label>
+        <small className="hint">
+          Firefox and Safari only allow copying right after a key press or click; when a long transcription misses that window, the message
+          at the bottom offers a Copy button.
+        </small>
       </fieldset>
 
       <fieldset className="field-group">
@@ -168,10 +172,14 @@ export function SettingsPanel({ settings, health, onChange, onReset }: Props) {
             data-testid="spoken-punctuation"
             onChange={(e) => onChange({ spokenPunctuation: e.target.value as Settings['spokenPunctuation'] })}
           >
-            <option value="auto">Automatic (only for browser speech, which does not punctuate)</option>
+            <option value="auto">Automatic (browser speech only)</option>
             <option value="on">Always on</option>
             <option value="off">Off</option>
           </select>
+          <small className="hint">
+            Browser speech does not punctuate by itself, so commands are on for it; Whisper engines punctuate on their own. While on,
+            “period”, “comma” and “colon” are always commands: turn this off to dictate those words.
+          </small>
         </label>
       </fieldset>
 
@@ -183,6 +191,7 @@ export function SettingsPanel({ settings, health, onChange, onReset }: Props) {
             type="checkbox"
             checked={settings.autoPolish}
             disabled={!health?.polish}
+            data-testid="auto-polish"
             onChange={(e) => onChange({ autoPolish: e.target.checked })}
           />
           <span>Polish every dictation automatically</span>
@@ -197,10 +206,11 @@ export function SettingsPanel({ settings, health, onChange, onReset }: Props) {
           >
             {(Object.keys(POLISH_MODES) as PolishMode[]).map((mode) => (
               <option key={mode} value={mode}>
-                {POLISH_MODES[mode].label} — {POLISH_MODES[mode].hint}
+                {POLISH_MODES[mode].label}
               </option>
             ))}
           </select>
+          <small className="hint">{POLISH_MODES[settings.polishMode].hint}</small>
         </label>
       </fieldset>
 

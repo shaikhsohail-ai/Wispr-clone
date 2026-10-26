@@ -39,6 +39,8 @@ export class PcmRecorder {
   private chunks: Float32Array[] = [];
   private levelBuffer: Float32Array<ArrayBuffer> | null = null;
   private flushed: (() => void) | null = null;
+  /** Set by cancel(); a start() that is still waiting for the microphone then releases it instead of recording. */
+  private cancelled = false;
 
   constructor(private readonly workletUrl = `${import.meta.env.BASE_URL}pcm-worklet.js`) {}
 
@@ -50,9 +52,11 @@ export class PcmRecorder {
     if (this.state !== 'idle') throw new RecorderError('Recorder is busy', 'failed');
     if (!PcmRecorder.isSupported()) throw new RecorderError('This browser cannot record audio', 'unsupported');
     this.state = 'starting';
+    this.cancelled = false;
     this.chunks = [];
+    let stream: MediaStream;
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           deviceId: deviceId ? { exact: deviceId } : undefined,
           channelCount: 1,
@@ -65,8 +69,16 @@ export class PcmRecorder {
       this.state = 'idle';
       throw toRecorderError(err);
     }
+    if (this.cancelled) {
+      // cancel() ran while the permission prompt or device was still opening: let the microphone go again.
+      stream.getTracks().forEach((t) => t.stop());
+      this.state = 'idle';
+      throw new RecorderError('Recording was cancelled', 'failed');
+    }
+    this.stream = stream;
     try {
       await this.buildGraph();
+      if (this.cancelled) throw new RecorderError('Recording was cancelled', 'failed');
       this.state = 'recording';
     } catch (err) {
       await this.teardown();
@@ -102,6 +114,7 @@ export class PcmRecorder {
   }
 
   async cancel(): Promise<void> {
+    this.cancelled = true;
     this.chunks = [];
     await this.teardown();
     this.state = 'idle';

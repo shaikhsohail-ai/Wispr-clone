@@ -1,7 +1,10 @@
 import type { DictionaryEntry } from './types.js';
 
-/** Hesitation sounds removed by default. Anything that could be a real word is left out. */
-export const DEFAULT_FILLERS = ['um', 'umm', 'uh', 'uhh', 'uhm', 'erm', 'er', 'hmm', 'hm', 'mhm', 'mm'];
+/**
+ * Hesitation sounds removed by default. Anything that could be a real word is left out: "mm" (millimetres),
+ * "er" (ER, the emergency room) and "hm" (HM Treasury) are deliberately not on this list.
+ */
+export const DEFAULT_FILLERS = ['um', 'umm', 'uh', 'uhh', 'uhm', 'erm', 'hmm', 'mhm'];
 
 /** Average typing speed used to estimate time saved by dictating instead of typing. */
 export const TYPING_WPM = 40;
@@ -45,7 +48,7 @@ const SPOKEN_COMMANDS: SpokenCommand[] = [
   { phrases: ['comma'], replacement: ',', kind: 'closing' },
   { phrases: ['question mark'], replacement: '?', kind: 'closing' },
   { phrases: ['exclamation mark', 'exclamation point'], replacement: '!', kind: 'closing' },
-  { phrases: ['semicolon', 'semi colon'], replacement: ';', kind: 'closing' },
+  { phrases: ['semicolon', 'semi colon', 'semi-colon'], replacement: ';', kind: 'closing' },
   { phrases: ['colon'], replacement: ':', kind: 'closing' },
   { phrases: ['close quote', 'end quote', 'close quotes', 'end quotes'], replacement: '"', kind: 'closing' },
   { phrases: ['open quote', 'begin quote', 'open quotes', 'begin quotes'], replacement: '"', kind: 'opening' },
@@ -53,24 +56,35 @@ const SPOKEN_COMMANDS: SpokenCommand[] = [
   { phrases: ['open paren', 'open parenthesis', 'open bracket'], replacement: '(', kind: 'opening' },
 ];
 
-const SCRATCH_THAT = /([.!?\n]|^)[^.!?\n]*?(?<![\w])(?:scratch that|delete that)(?![\w])[,.!?]?/gi;
+/**
+ * "scratch that" / "delete that" removes the sentence the command appears in, back to the previous sentence
+ * boundary. Several commands in one sentence each delete back to the previous command. Engines may put a
+ * terminator before as well as after the command (". Scratch that."); a command that starts its own sentence
+ * (optionally after "actually", "no", "wait", "sorry" or "oh") refers to the sentence before it.
+ */
+const SCRATCH_THAT =
+  /([.!?\n]|^)(?:[^.!?\n]*?[.!?]?\s*(?:(?:actually|no|wait|sorry|oh),?\s+)?(?<![\w])(?:scratch that|delete that)(?![\w])[,.!?]?)+/gi;
 
-/** Expand spoken punctuation commands. Engines sometimes add their own mark after the word ("period."), which is absorbed. */
+/**
+ * Expand spoken punctuation commands. Engines sometimes add their own mark after the word ("period."), which is
+ * absorbed. A command word joined by a hyphen ("comma-separated", "end-of-period") is left alone. The scratch pass
+ * runs last so that spoken sentence breaks already exist as boundaries.
+ */
 export function applySpokenPunctuation(text: string): string {
-  let out = text.replace(SCRATCH_THAT, '$1');
+  let out = text;
   for (const cmd of SPOKEN_COMMANDS) {
     for (const phrase of cmd.phrases) {
       const body = escapeRegExp(phrase).replace(/\s+/g, '\\s+');
       if (cmd.kind === 'closing') {
-        out = out.replace(new RegExp(`\\s*(?<![\\w])${body}(?![\\w])[,.!?;:]?`, 'gi'), cmd.replacement);
+        out = out.replace(new RegExp(`\\s*(?<![\\w-])${body}(?![\\w-])[,.!?;:]?`, 'gi'), cmd.replacement);
       } else if (cmd.kind === 'opening') {
-        out = out.replace(new RegExp(`(?<![\\w])${body}(?![\\w])[,.!?;:]?\\s*`, 'gi'), ` ${cmd.replacement}`);
+        out = out.replace(new RegExp(`(?<![\\w-])${body}(?![\\w-])[,.!?;:]?\\s*`, 'gi'), ` ${cmd.replacement}`);
       } else {
-        out = out.replace(new RegExp(`\\s*(?<![\\w])${body}(?![\\w])[,.!?;:]?\\s*`, 'gi'), cmd.replacement);
+        out = out.replace(new RegExp(`\\s*(?<![\\w-])${body}(?![\\w-])[,.!?;:]?\\s*`, 'gi'), cmd.replacement);
       }
     }
   }
-  return out;
+  return out.replace(SCRATCH_THAT, '$1');
 }
 
 /** Remove hesitation sounds. Parenthetical fillers (", um,") collapse to a single comma. */
@@ -79,11 +93,13 @@ export function removeFillerWords(text: string, fillers: string[] = DEFAULT_FILL
   if (words.length === 0) return text;
   const alternation = words.map((w) => escapeRegExp(w).replace(/\s+/g, '\\s+')).join('|');
   const parenthetical = new RegExp(`,\\s*(?<![\\w])(?:${alternation})(?![\\w])\\s*,`, 'gi');
-  const standalone = new RegExp(`\\s*(?<![\\w])(?:${alternation})(?![\\w]),?(?=\\s|$|[.!?;:,])`, 'gi');
+  // Only horizontal whitespace before the filler, so a "new paragraph" or engine line break survives.
+  const standalone = new RegExp(`[ \\t]*(?<![\\w])(?:${alternation})(?![\\w]),?(?=\\s|$|[.!?;:,])`, 'gi');
   return text
     .replace(parenthetical, ',')
     .replace(standalone, '')
     .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n[ \t]+/g, '\n')
     .replace(/^[ \t]+/, '');
 }
 
@@ -105,7 +121,8 @@ export function tidyWhitespace(text: string): string {
     .replace(/[ \t\u00a0]+/g, ' ')
     .replace(/ *\n */g, '\n')
     .replace(/\n{3,}/g, '\n\n')
-    .replace(/ +([,.!?;:)])/g, '$1')
+    .replace(/ +([,!?;:)])/g, '$1')
+    .replace(/ +\.(?![\p{L}\p{N}])/gu, '.')
     .replace(/\( +/g, '(')
     .replace(/([,?!;:])(?=[A-Za-zÀ-ɏ])/g, '$1 ')
     .replace(/([,;:?!])\1+/g, '$1')
@@ -116,17 +133,25 @@ export function tidyWhitespace(text: string): string {
     .trim();
 }
 
-/** Capitalise sentence starts and the pronoun "I". */
+/**
+ * Capitalise sentence starts and the pronoun "I". A full stop that ends a dotted initialism ("e.g.", "U.S.", "p.m.")
+ * or a common title ("Dr.", "Mrs.", "vs.") does not end a sentence. An opening quote or parenthesis may sit between
+ * the boundary and the first letter, and typographic quotes and apostrophes count like straight ones.
+ */
 export function capitalizeSentences(text: string): string {
   return text
-    .replace(/(^|[.!?]["')]?\s+|\n\s*|^["(]\s*)([a-zà-ÿ])/g, (_m, pre: string, ch: string) => pre + ch.toUpperCase())
-    .replace(/(^|[\s("])i(?=['\s.,!?;:)]|$)/g, '$1I');
+    .replace(
+      /(^|[.!?](?<![A-Za-z]\.[A-Za-z]\.)(?<!\b(?:[Vv]s|[Dd]r|[Mm]rs?|[Mm]s|[Ss]t|[Jj]r|[Ss]r|[Pp]rof)\.)["'”’)]?\s+|\n\s*)(["“'‘(]?\s*)([a-zà-ÿ])/g,
+      (_m, pre: string, open: string, ch: string) => pre + open + ch.toUpperCase(),
+    )
+    .replace(/(^|[\s("“‘])i(?=['’\s,!?;:)]|\.(?![A-Za-z])|$)/g, '$1I');
 }
 
+/** Add a full stop when the text ends without one. A trailing comma (a cut-off phrase, or a spoken "comma") is replaced. */
 export function ensureTerminalPunctuation(text: string): string {
-  const trimmed = text.trimEnd();
+  const trimmed = text.trimEnd().replace(/[,\s]+$/, '');
   if (!trimmed) return trimmed;
-  if (/[.!?…:;"')\]]$/.test(trimmed)) return trimmed;
+  if (/[.!?…:;"'”’)\]]$/.test(trimmed)) return trimmed;
   return `${trimmed}.`;
 }
 
@@ -150,6 +175,8 @@ export function cleanTranscript(raw: string, options: CleanupOptions = {}): stri
   if (removeFillers) text = removeFillerWords(text, fillerWords);
   text = applyDictionary(text, dictionary);
   text = tidyWhitespace(text);
+  // Fillers or commands alone can leave only punctuation behind ("Um." → "."); that is nothing to keep.
+  if (!/[\p{L}\p{N}]/u.test(text)) return '';
   if (capitalize) text = capitalizeSentences(text);
   if (ensureTerminal) text = ensureTerminalPunctuation(text);
   return text.trim();

@@ -1,5 +1,5 @@
-import type { PointerEvent } from 'react';
-import type { Phase } from '../hooks/useDictation';
+import type { KeyboardEvent, PointerEvent } from 'react';
+import { isBusyPhase, type Phase } from '../hooks/useDictation';
 import type { TalkMode } from '../lib/settings';
 
 interface Props {
@@ -10,10 +10,10 @@ interface Props {
   onToggle: () => void;
 }
 
-const BUSY: Phase[] = ['transcribing', 'polishing', 'saving'];
+const isActivationKey = (event: KeyboardEvent<HTMLButtonElement>) => event.key === 'Enter' || event.key === ' ';
 
 export function MicButton({ phase, talkMode, onStart, onStop, onToggle }: Props) {
-  const busy = BUSY.includes(phase);
+  const busy = isBusyPhase(phase);
   const listening = phase === 'listening';
 
   const handlePointerDown = (event: PointerEvent<HTMLButtonElement>) => {
@@ -31,11 +31,26 @@ export function MicButton({ phase, talkMode, onStart, onStop, onToggle }: Props)
     if (listening) onStop();
   };
 
+  // Keyboard on the focused button: in hold mode Enter and Space work like a held key (the global hotkey may also
+  // see Space; start()/stop() ignore the duplicate). Preventing the default also suppresses the native click.
+  const handleKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (talkMode !== 'hold' || !isActivationKey(event)) return;
+    event.preventDefault();
+    if (event.repeat || busy) return;
+    onStart();
+  };
+
+  const handleKeyUp = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (talkMode !== 'hold' || !isActivationKey(event)) return;
+    event.preventDefault();
+    if (listening) onStop();
+  };
+
   const label = busy
     ? 'Working…'
     : listening
       ? talkMode === 'hold'
-        ? 'Release to transcribe'
+        ? 'Release (or press again) to transcribe'
         : 'Stop'
       : talkMode === 'hold'
         ? 'Hold to talk'
@@ -50,12 +65,19 @@ export function MicButton({ phase, talkMode, onStart, onStop, onToggle }: Props)
       aria-pressed={listening}
       aria-label={label}
       title={label}
-      disabled={busy}
+      // aria-disabled keeps the button focusable while a run is in flight, so keyboard users do not lose their place.
+      aria-disabled={busy || undefined}
+      aria-busy={busy || undefined}
       onPointerDown={handlePointerDown}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
+      onKeyDown={handleKeyDown}
+      onKeyUp={handleKeyUp}
       onClick={(event) => {
-        if (talkMode === 'toggle' && !busy) {
+        if (busy) return;
+        // A pointer click carries detail >= 1 and is handled by the pointer events above. A click with detail 0 comes
+        // from a screen reader or switch, which cannot hold a key, so it toggles even in hold mode.
+        if (talkMode === 'toggle' || event.detail === 0) {
           event.preventDefault();
           onToggle();
         }

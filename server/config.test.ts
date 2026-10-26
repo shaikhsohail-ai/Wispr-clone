@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, loadDotEnv, parseDotEnv } from './config.js';
@@ -16,6 +16,7 @@ describe('loadConfig', () => {
     expect(c.enableMockEngine).toBe(false);
     expect(c.maxUploadBytes).toBe(50 * 1024 * 1024);
     expect(c.staticDir).toBeNull();
+    expect(c.allowedHosts).toEqual([]);
   });
 
   it('reads overrides and treats falsy strings as off', () => {
@@ -30,6 +31,7 @@ describe('loadConfig', () => {
         WISPR_ENABLE_MOCK_ENGINE: 'false',
         WISPR_LOCAL_PRELOAD: 'yes',
         WISPR_MAX_UPLOAD_MB: 'abc',
+        WISPR_ALLOWED_HOSTS: ' Dictate.Example.com, .lan.example ,',
       },
       '/repo',
     );
@@ -43,6 +45,20 @@ describe('loadConfig', () => {
     expect(c.enableMockEngine).toBe(false);
     expect(c.localPreload).toBe(true);
     expect(c.maxUploadBytes).toBe(50 * 1024 * 1024);
+    expect(c.allowedHosts).toEqual(['dictate.example.com', '.lan.example']);
+  });
+
+  it('serves the built web app when its index.html exists', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wispr-config-'));
+    try {
+      await mkdir(join(dir, 'dist'));
+      await writeFile(join(dir, 'dist', 'index.html'), '<html></html>');
+      expect(loadConfig({}, dir).staticDir).toBe(join(dir, 'dist'));
+      expect(loadConfig({ WISPR_STATIC_DIR: join(dir, 'dist') }, '/elsewhere').staticDir).toBe(join(dir, 'dist'));
+      expect(loadConfig({ WISPR_STATIC_DIR: join(dir, 'missing') }, dir).staticDir).toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

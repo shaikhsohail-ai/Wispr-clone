@@ -1,5 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { resolve } from 'node:path';
+import { isIP } from 'node:net';
+import { resolve, sep } from 'node:path';
 import type {
   ApiError,
   DictationPatch,
@@ -10,11 +11,11 @@ import type {
   PolishRequest,
   TranscribeResult,
 } from '../src/shared/types.js';
-import { decodeWav } from '../src/shared/wav.js';
+import { decodeWav, type DecodedWav } from '../src/shared/wav.js';
 import type { ServerConfig } from './config.js';
-import { EngineError, type EngineRegistry } from './engines/index.js';
+import { ENGINE_IDS, EngineError, type EngineRegistry } from './engines/index.js';
 import { PolishError, type Polisher } from './polish.js';
-import type { DictationStore } from './store.js';
+import { clampDuration, type DictationStore } from './store.js';
 
 export interface AppDeps {
   config: ServerConfig;
@@ -24,10 +25,16 @@ export interface AppDeps {
   version: string;
 }
 
-const ENGINE_IDS: EngineId[] = ['webspeech', 'openai', 'local', 'mock'];
 const POLISH_MODES: PolishMode[] = ['clean', 'formal', 'casual', 'concise'];
 const LANGUAGE_RE = /^(auto|[a-z]{2,3}(-[A-Za-z0-9]{2,8})?)$/;
 const MAX_TEXT_CHARS = 200_000;
+const MAX_POLISH_CHARS = 20_000;
+const MAX_DICTIONARY_ENTRIES = 200;
+/** Dictionary entries are spellings of names and jargon; anything longer is not one and would only pad the prompt. */
+const MAX_DICTIONARY_ENTRY_CHARS = 120;
+/** Sample rates outside this range are not speech recordings; a forged rate would also defeat the duration limit. */
+const MIN_SAMPLE_RATE = 8_000;
+const MAX_SAMPLE_RATE = 192_000;
 
 export class HttpError extends Error {
   constructor(
@@ -58,7 +65,8 @@ function parseNewDictation(body: unknown): NewDictation {
   const rawText = typeof body.rawText === 'string' ? body.rawText : text;
   const engine = body.engine as EngineId;
   if (!ENGINE_IDS.includes(engine)) throw new HttpError(400, 'engine must be one of ' + ENGINE_IDS.join(', '));
-  const durationMs = typeof body.durationMs === 'number' && Number.isFinite(body.durationMs) ? body.durationMs : 0;
+  // Clamp rather than reject: losing a transcript over a metadata field would be worse than capping the metadata.
+  const durationMs = clampDuration(body.durationMs);
   return {
     text,
     rawText: rawText.slice(0, MAX_TEXT_CHARS),
@@ -85,18 +93,26 @@ function parsePatch(body: unknown): DictationPatch {
   return patch;
 }
 
+/** One line of plain text: control characters (including newlines) become spaces so an entry cannot break out of its prompt line. */
+function dictionaryField(value: unknown): string {
+  return String(value ?? '')
+    .replace(/\p{Cc}/gu, ' ')
+    .trim();
+}
+
 function parsePolishRequest(body: unknown): PolishRequest {
   if (!isRecord(body)) throw new HttpError(400, 'Expected a JSON object');
   if (typeof body.text !== 'string') throw new HttpError(400, 'text is required');
-  if (body.text.length > 20_000) throw new HttpError(413, 'text is too long to polish (max 20,000 characters)');
+  if (body.text.length > MAX_POLISH_CHARS)
+    throw new HttpError(413, `text is too long to polish (max ${MAX_POLISH_CHARS.toLocaleString('en-GB')} characters)`);
   const mode = (typeof body.mode === 'string' ? body.mode : 'clean') as PolishMode;
   if (!POLISH_MODES.includes(mode)) throw new HttpError(400, 'mode must be one of ' + POLISH_MODES.join(', '));
   const dictionary = Array.isArray(body.dictionary)
     ? body.dictionary
         .filter(isRecord)
-        .map((e) => ({ from: String(e.from ?? ''), to: String(e.to ?? '') }))
-        .filter((e) => e.from.trim())
-        .slice(0, 200)
+        .map((e) => ({ from: dictionaryField(e.from), to: dictionaryField(e.to) }))
+        .filter((e) => e.from && e.from.length <= MAX_DICTIONARY_ENTRY_CHARS && e.to.length <= MAX_DICTIONARY_ENTRY_CHARS)
+        .slice(0, MAX_DICTIONARY_ENTRIES)
     : [];
   return { text: body.text, mode, dictionary };
 }
@@ -114,6 +130,42 @@ function exportDictations(items: ReturnType<DictationStore['all']>, format: stri
   throw new HttpError(400, 'format must be txt, md or json');
 }
 
+/** Hostname of a `Host` header value or an origin URL, or null when it does not parse. */
+function hostnameOf(value: string): string | null {
+  try {
+    return new URL(value.includes('://') ? value : `http://${value}`).hostname;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Only answer requests addressed to this machine (localhost, any IP literal or a name from WISPR_ALLOWED_HOSTS),
+ * and only from pages served under such a name. A page elsewhere whose DNS name is re-pointed at 127.0.0.1
+ * (DNS rebinding) would otherwise read and wipe the history and spend the configured API keys; an attacker
+ * has to use a DNS name, so IP literals stay open for LAN use with HOST=0.0.0.0.
+ */
+function createHostGuard(allowedHosts: string[]) {
+  const allowed = (hostname: string | null): boolean => {
+    if (!hostname) return false;
+    const name = hostname.toLowerCase();
+    if (name === 'localhost' || name.endsWith('.localhost')) return true;
+    if (isIP(name.replace(/^\[|\]$/g, ''))) return true;
+    return allowedHosts.some((entry) => (entry.startsWith('.') ? name === entry.slice(1) || name.endsWith(entry) : name === entry));
+  };
+  return (req: Request, _res: Response, next: NextFunction) => {
+    const host = req.headers.host ?? '';
+    if (!allowed(hostnameOf(host))) {
+      return next(new HttpError(403, `Requests for host "${host}" are not accepted; add it to WISPR_ALLOWED_HOSTS`, 'forbidden_host'));
+    }
+    const origin = req.headers.origin;
+    if (origin !== undefined && !allowed(hostnameOf(origin))) {
+      return next(new HttpError(403, `Requests from origin "${origin}" are not accepted`, 'forbidden_origin'));
+    }
+    next();
+  };
+}
+
 export function createApp(deps: AppDeps): express.Express {
   const { config, store, engines, polisher } = deps;
   const app = express();
@@ -121,6 +173,7 @@ export function createApp(deps: AppDeps): express.Express {
   app.set('etag', false);
 
   const api = express.Router();
+  api.use(createHostGuard(config.allowedHosts));
   api.use(express.json({ limit: '2mb' }));
 
   api.get('/health', (_req, res) => {
@@ -150,16 +203,20 @@ export function createApp(deps: AppDeps): express.Express {
       const language = parseLanguage(req.query.language);
       if (!Buffer.isBuffer(req.body) || req.body.length === 0)
         throw new HttpError(400, 'Send the recording as the request body with Content-Type: audio/wav');
-      let durationMs: number;
+      const started = Date.now();
+      let decoded: DecodedWav;
       try {
-        durationMs = decodeWav(req.body).durationMs;
+        decoded = decodeWav(req.body);
       } catch (err) {
         throw new HttpError(400, `Could not read the audio: ${(err as Error).message}`);
       }
+      if (decoded.sampleRate < MIN_SAMPLE_RATE || decoded.sampleRate > MAX_SAMPLE_RATE)
+        throw new HttpError(400, `Unsupported sample rate ${decoded.sampleRate} Hz`);
+      if (decoded.channels > 2) throw new HttpError(400, `Unsupported channel count ${decoded.channels}`);
+      const durationMs = decoded.durationMs;
       if (durationMs < 150) throw new HttpError(400, 'The recording is too short, nothing was captured', 'empty_audio');
       if (durationMs > config.maxAudioSeconds * 1000)
         throw new HttpError(413, `Recordings are limited to ${config.maxAudioSeconds} seconds`);
-      const started = Date.now();
       const output = await engine.transcribe({ wav: req.body, language, durationMs });
       const result: TranscribeResult = {
         text: output.text,
@@ -230,7 +287,18 @@ export function createApp(deps: AppDeps): express.Express {
 
   if (config.staticDir) {
     const indexHtml = resolve(config.staticDir, 'index.html');
-    app.use(express.static(config.staticDir, { index: 'index.html', maxAge: '1h' }));
+    const assetsDir = resolve(config.staticDir, 'assets') + sep;
+    app.use(
+      express.static(config.staticDir, {
+        index: 'index.html',
+        // Vite content-hashes everything under assets/, so those files can be cached for good. The entry page
+        // and the unhashed public files (worklet, manifest, icon) must be revalidated on every load, or a
+        // browser keeps an old index.html that points at bundles a rebuild has deleted.
+        setHeaders: (res, filePath) => {
+          res.setHeader('Cache-Control', filePath.startsWith(assetsDir) ? 'public, max-age=31536000, immutable' : 'no-cache');
+        },
+      }),
+    );
     app.get(/^(?!\/api(\/|$)).*/, (req, res, next) => {
       if (req.method !== 'GET' || !(req.headers.accept ?? '').includes('text/html')) return next();
       res.setHeader('Cache-Control', 'no-cache');
@@ -241,6 +309,7 @@ export function createApp(deps: AppDeps): express.Express {
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     const payload: ApiError = { error: 'Internal server error', code: 'internal' };
     let status = 500;
+    const clientStatus = isRecord(err) ? (typeof err.status === 'number' ? err.status : err.statusCode) : undefined;
     if (err instanceof HttpError || err instanceof EngineError || err instanceof PolishError) {
       status = err.status;
       payload.error = err.message;
@@ -253,6 +322,12 @@ export function createApp(deps: AppDeps): express.Express {
       status = 400;
       payload.error = 'Malformed JSON body';
       payload.code = 'bad_json';
+    } else if (isRecord(err) && typeof clientStatus === 'number' && clientStatus >= 400 && clientStatus < 500) {
+      // body-parser (bad Content-Encoding or charset) and the router (undecodable %-escapes in a path) attach a
+      // 4xx status; `expose` marks the messages http-errors considers safe to return.
+      status = clientStatus;
+      payload.error = err.expose === true && typeof err.message === 'string' ? err.message : 'Bad request';
+      payload.code = status === 415 ? 'unsupported_media_type' : 'bad_request';
     } else {
       console.error('[api] unhandled error:', err);
     }

@@ -9,20 +9,31 @@ interface Props {
   interimText: string;
   result: EditorDictation | null;
   error: string | null;
+  /** The audio of the failed run is still held, so the transcription can be resent. */
+  canRetry: boolean;
   activeEngine: EngineId | null;
   elapsedMs: number;
   canPolish: boolean;
   polishMode: PolishMode;
   hotkeyLabel: string;
   talkMode: TalkMode;
+  /** Phone or tablet: instructions talk about the button rather than a key. */
+  touchFirst: boolean;
   onPolishModeChange: (mode: PolishMode) => void;
-  onPolish: (mode: PolishMode) => void;
+  /** Polish what the user sees: the current draft, edits included. */
+  onPolish: (mode: PolishMode, text: string) => void;
   onSave: (text: string) => void;
+  onRetrySave: () => void;
   onDelete: () => void;
   onCopy: (text: string) => void;
   onNew: () => void;
+  onCancel: () => void;
+  onRetry: () => void;
   onDismissError: () => void;
 }
+
+/** After this long on the local engine, explain that the first run downloads the model. */
+const LOCAL_SLOW_MS = 10_000;
 
 function formatClock(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -30,7 +41,8 @@ function formatClock(ms: number): string {
 }
 
 export function TranscriptPanel(props: Props) {
-  const { phase, interimText, result, error, activeEngine, elapsedMs, canPolish, polishMode, hotkeyLabel, talkMode } = props;
+  const { phase, interimText, result, error, canRetry, activeEngine, elapsedMs, canPolish, polishMode, hotkeyLabel, talkMode, touchFirst } =
+    props;
   // The editable draft follows the result; when a different result (or an updated text) arrives, adopt it.
   const resultKey = result ? `${result.id}:${result.updatedAt}:${result.text}` : 'none';
   const [draftState, setDraftState] = useState({ key: resultKey, text: result?.text ?? '' });
@@ -44,6 +56,11 @@ export function TranscriptPanel(props: Props) {
         <h2>Something went wrong</h2>
         <p>{error}</p>
         <div className="actions">
+          {canRetry && (
+            <button type="button" className="btn btn-primary" data-testid="retry-button" onClick={props.onRetry}>
+              Try again
+            </button>
+          )}
           <button type="button" className="btn" onClick={props.onDismissError}>
             Dismiss
           </button>
@@ -57,25 +74,43 @@ export function TranscriptPanel(props: Props) {
       phase === 'listening'
         ? `Listening ${formatClock(elapsedMs)}`
         : phase === 'transcribing'
-          ? 'Transcribing…'
+          ? `Transcribing… ${formatClock(elapsedMs)}`
           : phase === 'polishing'
             ? 'Polishing with AI…'
             : 'Saving…';
+    const finishHint = touchFirst
+      ? talkMode === 'hold'
+        ? 'Let go of the button when you are done.'
+        : 'Tap the button again when you are done.'
+      : talkMode === 'hold'
+        ? `Release ${hotkeyLabel} when you are done.`
+        : `Press ${hotkeyLabel} again when you are done.`;
+    const canCancel = phase === 'transcribing' || (phase === 'listening' && talkMode === 'toggle');
+    // The clock and the interim transcript change constantly, so this panel is deliberately not a live region;
+    // phase changes are announced once by the status element in App.
     return (
-      <section className="panel transcript live" data-testid="transcript-live" aria-live="polite">
+      <section className="panel transcript live" data-testid="transcript-live">
         <div className="live-status">
           <span className={`dot ${phase === 'listening' ? 'dot-live' : 'dot-busy'}`} />
           <span data-testid="live-status">{label}</span>
           {activeEngine && <span className="chip">{ENGINE_SHORT_LABELS[activeEngine]}</span>}
+          {canCancel && (
+            <button type="button" className="btn btn-small btn-ghost live-cancel" data-testid="cancel-button" onClick={props.onCancel}>
+              Cancel
+            </button>
+          )}
         </div>
         <p className="live-text">
           {interimText ||
             (phase === 'listening'
               ? activeEngine === 'webspeech'
                 ? 'Speak now, words appear as they are recognised.'
-                : `Speak now. ${talkMode === 'hold' ? `Release ${hotkeyLabel}` : `Press ${hotkeyLabel} again`} when you are done.`
+                : `Speak now. ${finishHint}`
               : '')}
         </p>
+        {phase === 'transcribing' && activeEngine === 'local' && elapsedMs > LOCAL_SLOW_MS && (
+          <p className="hint">Local Whisper can take a while; the first run downloads the model (about 150 MB).</p>
+        )}
       </section>
     );
   }
@@ -85,7 +120,13 @@ export function TranscriptPanel(props: Props) {
       <section className="panel transcript empty" data-testid="transcript-empty">
         <h2>Your words, typed for you</h2>
         <p>
-          {talkMode === 'hold' ? (
+          {touchFirst ? (
+            talkMode === 'hold' ? (
+              <>Hold the microphone button, speak, then let go. With a keyboard, hold {hotkeyLabel}.</>
+            ) : (
+              <>Tap the microphone button to start, and again to finish. With a keyboard, press {hotkeyLabel}.</>
+            )
+          ) : talkMode === 'hold' ? (
             <>
               Hold <kbd>{hotkeyLabel}</kbd> (or the microphone button), speak, then let go.
             </>
@@ -100,7 +141,13 @@ export function TranscriptPanel(props: Props) {
           <li>Say “comma”, “new paragraph” or “scratch that” to format as you speak.</li>
           <li>Every dictation is saved to the history and copied to your clipboard.</li>
           <li>
-            Press <kbd>Esc</kbd> while listening to cancel.
+            {touchFirst ? (
+              <>Tap Cancel while a dictation is being transcribed to discard it.</>
+            ) : (
+              <>
+                Press <kbd>Esc</kbd> (or Cancel) while listening or transcribing to cancel.
+              </>
+            )}
           </li>
         </ul>
       </section>
@@ -118,7 +165,14 @@ export function TranscriptPanel(props: Props) {
         {result.durationMs > 0 && <span>{formatDuration(result.durationMs)}</span>}
         {wpm > 0 && <span>{wpm} wpm</span>}
         {result.polished && <span className="chip chip-accent">AI polished</span>}
-        {result.unsaved && <span className="chip chip-warn">Not saved</span>}
+        {result.unsaved && (
+          <>
+            <span className="chip chip-warn">Not saved</span>
+            <button type="button" className="btn btn-small" data-testid="retry-save-button" onClick={props.onRetrySave}>
+              Retry save
+            </button>
+          </>
+        )}
       </div>
       <textarea
         className="result-text"
@@ -165,13 +219,20 @@ export function TranscriptPanel(props: Props) {
             data-testid="polish-button"
             disabled={!canPolish}
             title={canPolish ? POLISH_MODES[polishMode].hint : 'Set ANTHROPIC_API_KEY on the server to enable AI polish'}
-            onClick={() => props.onPolish(polishMode)}
+            onClick={() => props.onPolish(polishMode, draft)}
           >
             ✨ Polish
           </button>
         </span>
         <span className="spacer" />
-        <button type="button" className="btn btn-ghost" data-testid="new-button" onClick={props.onNew}>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          data-testid="new-button"
+          onClick={() => {
+            if (!dirty || window.confirm('Discard your unsaved changes?')) props.onNew();
+          }}
+        >
           New dictation
         </button>
         <button type="button" className="btn btn-danger" data-testid="delete-button" onClick={props.onDelete}>
