@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import request from 'supertest';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PolishRequest } from '../src/shared/types.js';
 import { encodeWav } from '../src/shared/wav.js';
 import { createApp } from './app.js';
@@ -278,13 +278,26 @@ describe('dictations API', () => {
 });
 
 describe('host allow-list', () => {
+  let warn: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warn.mockRestore();
+  });
+
   it('rejects requests for or from hosts that are not this machine', async () => {
     const { polisher, calls } = recordingPolisher();
     const { app } = await build({ polisher, env: { WISPR_ALLOWED_HOSTS: 'dictate.example.com, .lan.example' } });
     const rogue = await request(app).get('/api/dictations/export?format=json').set('Host', 'evil.example');
     expect(rogue.status).toBe(403);
     expect(rogue.body.code).toBe('forbidden_host');
+    expect((await request(app).get('/api/stats').set('Host', 'evil.example')).status).toBe(403);
+    // Logged once per message, so a refused deployment polling every few seconds does not flood the logs.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[api] 403 Requests for host "evil.example"'));
     expect((await request(app).delete('/api/dictations').set('Host', 'evil.example:8787')).status).toBe(403);
+    expect(warn).toHaveBeenCalledTimes(2);
     expect((await request(app).post('/api/polish').set('Host', 'evil.example').send({ text: 'x', mode: 'clean' })).status).toBe(403);
     const rogueOrigin = await request(app).post('/api/polish').set('Origin', 'http://evil.example').send({ text: 'x', mode: 'clean' });
     expect(rogueOrigin.status).toBe(403);
@@ -395,6 +408,24 @@ describe('static web app', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('serves the manifest and icon without the password, which browsers fetch without credentials', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wispr-static-'));
+    try {
+      await writeFile(join(dir, 'index.html'), '<!doctype html><div id="root"></div>');
+      await writeFile(join(dir, 'manifest.webmanifest'), '{"name":"Wispr Clone"}');
+      await writeFile(join(dir, 'icon.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>');
+      const { app } = await build({ env: { WISPR_STATIC_DIR: dir, WISPR_PASSWORD: 'correct horse battery' } });
+      const manifest = await request(app).get('/manifest.webmanifest');
+      expect(manifest.status).toBe(200);
+      expect(manifest.headers['content-type']).toMatch(/manifest/);
+      expect((await request(app).get('/icon.svg')).status).toBe(200);
+      expect((await request(app).get('/').set('Accept', 'text/html')).status).toBe(401);
+      expect((await request(app).get('/pcm-worklet.js')).status).toBe(401);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('misc', () => {
@@ -408,6 +439,13 @@ describe('misc', () => {
 
 describe('password protection', () => {
   const creds = (user: string, password: string) => `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
+  let warn: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warn.mockRestore();
+  });
 
   it('is off by default', async () => {
     const { app } = await build();
@@ -426,6 +464,21 @@ describe('password protection', () => {
     expect((await request(app).get('/api/health')).status).toBe(200);
     const mutation = await request(app).post('/api/dictations').send({ text: 'x', engine: 'mock' });
     expect(mutation.status).toBe(401);
+    expect(warn).toHaveBeenCalledTimes(2); // the two wrong guesses; requests without credentials are not guesses
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[auth\] rejected credentials for GET \/api\/dictations/));
+  });
+
+  it('tells an anonymous health check only that the server is up', async () => {
+    const { app } = await build({ env: { WISPR_PASSWORD: 'hunter22', OPENAI_API_KEY: 'sk-test' } });
+    const probe = await request(app).get('/api/health');
+    expect(probe.status).toBe(200);
+    expect(probe.body).toEqual({ ok: true });
+    const wrong = await request(app).get('/api/health').set('Authorization', creds('wispr', 'nope'));
+    expect(wrong.status).toBe(200);
+    expect(wrong.body).toEqual({ ok: true });
+    const signedIn = await request(app).get('/api/health').set('Authorization', creds('wispr', 'hunter22'));
+    expect(signedIn.status).toBe(200);
+    expect(signedIn.body).toMatchObject({ ok: true, version: '1.2.3', engines: { mock: true }, polish: false });
   });
 
   it('honours WISPR_USERNAME', async () => {
@@ -454,6 +507,30 @@ describe('password protection', () => {
     expect(crossSite.body.code).toBe('forbidden_origin');
     const rebinding = await request(app).get('/api/stats').set('Host', 'evil.example').set('Origin', 'http://evil.example');
     expect(rebinding.status).toBe(401);
+  });
+
+  it('explains what to do when a proxy rewrites the Host header', async () => {
+    const { app } = await build({ env: { WISPR_PASSWORD: 'pw' } });
+    const rewritten = await request(app)
+      .post('/api/dictations')
+      .set('Host', '127.0.0.1:8787')
+      .set('Origin', 'https://dictate.example.com')
+      .set('Authorization', creds('wispr', 'pw'))
+      .send({ text: 'x', engine: 'mock' });
+    expect(rewritten.status).toBe(403);
+    expect(rewritten.body.code).toBe('forbidden_origin');
+    expect(rewritten.body.error).toMatch(
+      /origin "https:\/\/dictate.example.com".*host "127.0.0.1:8787".*original Host header.*WISPR_ALLOWED_HOSTS/,
+    );
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[api] 403 Requests from origin "https://dictate.example.com"'));
+    const listed = await build({ env: { WISPR_PASSWORD: 'pw', WISPR_ALLOWED_HOSTS: 'dictate.example.com' } });
+    const allowed = await request(listed.app)
+      .post('/api/dictations')
+      .set('Host', '127.0.0.1:8787')
+      .set('Origin', 'https://dictate.example.com')
+      .set('Authorization', creds('wispr', 'pw'))
+      .send({ text: 'x', engine: 'mock' });
+    expect(allowed.status).toBe(201);
   });
 
   it('without a password, a page served under an allowed name may call the API from that same name', async () => {

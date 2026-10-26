@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { createApp } from './app.js';
+import { MIN_PASSWORD_LENGTH } from './auth.js';
 import { loadConfig, loadDotEnv } from './config.js';
 import { createEngines } from './engines/index.js';
 import type { LocalEngine } from './engines/local.js';
@@ -25,6 +26,12 @@ const LOCAL_PROBE_TIMEOUT_MS = 5_000;
 async function main() {
   loadDotEnv();
   const config = loadConfig();
+  if (config.password && config.password.length < MIN_PASSWORD_LENGTH) {
+    // Fail at deploy time, where the message is read, rather than warn in a log nobody opens.
+    throw new Error(
+      `WISPR_PASSWORD must be at least ${MIN_PASSWORD_LENGTH} characters (yours has ${config.password.length}); a short password falls to online guessing on a public URL`,
+    );
+  }
   const version = await readVersion();
   const store = await DictationStore.open(config.dataFile);
   const engines = createEngines(config);
@@ -39,6 +46,7 @@ async function main() {
   const server = app.listen(config.port, config.host, () => {
     console.log(`Wispr Clone server listening on http://${config.host}:${config.port}`);
     console.log(`  history file : ${config.dataFile}`);
+    console.log(`  model cache  : ${config.modelCacheDir}`);
     console.log(`  web app      : ${config.staticDir ?? 'not built (run "npm run dev" for the Vite dev server, or "npm run build")'}`);
     console.log(`  OpenAI       : ${config.openaiApiKey ? `enabled (${config.openaiModel})` : 'disabled (set OPENAI_API_KEY)'}`);
     console.log(`  Local Whisper: ${local?.available() ? `enabled (${config.localModel})` : 'unavailable'}`);
@@ -46,7 +54,6 @@ async function main() {
     if (config.enableMockEngine) console.log('  Mock engine  : enabled');
     if (config.allowedHosts.length) console.log(`  Allowed hosts: localhost, IP addresses, ${config.allowedHosts.join(', ')}`);
     console.log(`  Password     : ${config.password ? `required (user "${config.username}")` : 'none'}`);
-    if (config.password && config.password.length < 8) console.warn('  WARNING: WISPR_PASSWORD is shorter than 8 characters');
     if (!config.password && config.host !== '127.0.0.1' && config.host !== 'localhost' && config.host !== '::1') {
       console.warn(
         '  WARNING: listening on a non-loopback address without WISPR_PASSWORD; anyone who can reach this port can read and delete the history and use the API keys',

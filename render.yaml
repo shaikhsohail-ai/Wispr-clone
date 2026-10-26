@@ -3,6 +3,9 @@ services:
   - type: web
     name: wispr-clone
     runtime: docker
+    # Starter has 512 MB of RAM: enough for browser speech and OpenAI, not for local Whisper (about 1 GB; the
+    # container is killed on the first local transcription). Pick Standard (2 GB) when creating the Blueprint
+    # if you want local Whisper.
     plan: starter
     healthCheckPath: /api/health
     disk:
@@ -14,6 +17,7 @@ services:
         value: 0.0.0.0
       - key: WISPR_DATA_DIR
         value: /data
+      # At least 12 characters; the server refuses to start with a shorter one.
       - key: WISPR_PASSWORD
         sync: false
       - key: OPENAI_API_KEY

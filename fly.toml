@@ -1,7 +1,7 @@
 # Fly.io configuration. Steps (see README "Deploying"):
 #   fly launch --copy-config --no-deploy --name <your-app-name>
 #   fly volumes create wispr_data --size 1
-#   fly secrets set WISPR_PASSWORD=<choose one> OPENAI_API_KEY=... ANTHROPIC_API_KEY=...
+#   fly secrets set WISPR_PASSWORD=<choose one, 12+ characters> OPENAI_API_KEY=... ANTHROPIC_API_KEY=...
 #   fly deploy
 app = "wispr-clone"
 primary_region = "lhr"

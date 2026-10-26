@@ -21,6 +21,8 @@ export function App() {
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
   const [health, setHealth] = useState<HealthInfo | null>(null);
   const [serverOnline, setServerOnline] = useState<boolean | null>(null);
+  /** Why the last health poll failed, e.g. the server's 403 host message; shown as a tooltip on "Server offline". */
+  const [serverProblem, setServerProblem] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('history');
   const [historyVersion, bumpHistory] = useReducer((n: number) => n + 1, 0);
   const { toasts, notify, dismiss } = useToasts();
@@ -48,16 +50,18 @@ export function App() {
         if (cancelled) return;
         setHealth(info);
         setServerOnline(true);
+        setServerProblem(null);
         if (wasDown) {
           // The sidebar only refetches when the version changes; refresh it now that the server is back.
           wasDown = false;
           bumpHistory();
         }
         timer = window.setTimeout(poll, 30_000);
-      } catch {
+      } catch (err) {
         if (cancelled) return;
         wasDown = true;
         setServerOnline(false);
+        setServerProblem(err instanceof Error ? err.message : String(err));
         timer = window.setTimeout(poll, 4_000);
       }
     };
@@ -182,7 +186,9 @@ export function App() {
         </div>
         <div className="topbar-status" data-testid="server-status">
           <span className={`dot ${serverOnline ? 'dot-ok' : serverOnline === false ? 'dot-bad' : 'dot-busy'}`} />
-          <span>{serverOnline ? 'Server connected' : serverOnline === false ? 'Server offline' : 'Connecting…'}</span>
+          <span title={serverOnline === false ? (serverProblem ?? undefined) : undefined}>
+            {serverOnline ? 'Server connected' : serverOnline === false ? 'Server offline' : 'Connecting…'}
+          </span>
           <span className="chip" data-testid="engine-chip">
             {engine ? ENGINE_SHORT_LABELS[engine] : 'No engine'}
           </span>

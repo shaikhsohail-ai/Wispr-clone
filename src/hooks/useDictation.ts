@@ -44,7 +44,7 @@ const ENGINE_PRIORITY: EngineId[] = ['openai', 'webspeech', 'local', 'mock'];
 
 export function isEngineAvailable(id: EngineId, health: HealthInfo | null): boolean {
   if (id === 'webspeech') return isWebSpeechSupported();
-  return Boolean(health?.engines[id]);
+  return Boolean(health?.engines?.[id]);
 }
 
 /** The engine a dictation will use: the user's pick, or the best available one on 'auto'. */

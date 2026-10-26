@@ -41,7 +41,7 @@ export function SettingsPanel({ settings, health, onChange, onReset }: Props) {
     };
   }, []);
 
-  const engines = ENGINE_ORDER.filter((id) => id !== 'mock' || health?.engines.mock);
+  const engines = ENGINE_ORDER.filter((id) => id !== 'mock' || health?.engines?.mock);
 
   return (
     <div className="settings" data-testid="settings">

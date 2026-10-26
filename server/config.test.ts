@@ -48,6 +48,14 @@ describe('loadConfig', () => {
     expect(c.allowedHosts).toEqual(['dictate.example.com', '.lan.example']);
   });
 
+  it('keeps the model cache under the data directory unless WISPR_MODEL_CACHE_DIR names another place', () => {
+    // An empty value (as shipped in .env.example) means the default, so a copied .env cannot move the cache off a volume.
+    expect(loadConfig({ WISPR_DATA_DIR: '/data', WISPR_MODEL_CACHE_DIR: '' }, '/app').modelCacheDir).toBe('/data/models');
+    expect(loadConfig({ WISPR_DATA_DIR: '/data', WISPR_MODEL_CACHE_DIR: '/models' }, '/app').modelCacheDir).toBe('/models');
+    // A relative value is resolved against the working directory, as for WISPR_DATA_DIR itself.
+    expect(loadConfig({ WISPR_DATA_DIR: '/data', WISPR_MODEL_CACHE_DIR: 'cache' }, '/app').modelCacheDir).toBe('/app/cache');
+  });
+
   it('serves the built web app when its index.html exists', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'wispr-config-'));
     try {

@@ -20,6 +20,9 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      # The compose file must load without any variable set (the README's plain `docker compose up`) and
+      # with the https profile; `config` needs no daemon.
+      - run: docker compose config --quiet && DOMAIN=example.com docker compose --profile https config --quiet
       - run: npx playwright install --with-deps chromium
       - run: npx playwright test
         env:

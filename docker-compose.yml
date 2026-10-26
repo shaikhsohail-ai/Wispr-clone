@@ -1,8 +1,9 @@
-# Run Wispr Clone on any machine with Docker:
+# Run Wispr Clone on any machine with Docker (Compose plugin v2.24 or newer; check with `docker compose version`):
 #   docker compose up -d --build                  -> http://localhost:8787 (microphone works on localhost)
 #   DOMAIN=dictate.example.com docker compose --profile https up -d --build
 #                                                  -> https://dictate.example.com with automatic certificates
 # Put secrets (WISPR_PASSWORD, OPENAI_API_KEY, ANTHROPIC_API_KEY) in a .env file next to this file.
+# DOMAIN is only needed for the https profile.
 services:
   wispr:
     build: .
@@ -15,6 +16,9 @@ services:
       HOST: 0.0.0.0
       PORT: '8787'
       WISPR_DATA_DIR: /data
+      # Pinned like WISPR_DATA_DIR, so a relative value copied from .env.example cannot put the downloaded
+      # Whisper model outside the volume (it would then be fetched again after every rebuild).
+      WISPR_MODEL_CACHE_DIR: /data/models
     ports:
       - '127.0.0.1:8787:8787'
     volumes:
@@ -30,7 +34,12 @@ services:
       - '80:80'
       - '443:443'
     environment:
-      DOMAIN: ${DOMAIN:?set DOMAIN to the host name that points at this machine}
+      # Compose interpolates every service before it applies profiles, so a required `${DOMAIN:?}` here would
+      # also abort the plain `docker compose up`. The value is checked when Caddy starts instead.
+      DOMAIN: ${DOMAIN:-}
+    command: >
+      sh -c '[ -n "$$DOMAIN" ] || { echo "set DOMAIN to the host name that points at this machine, e.g. DOMAIN=dictate.example.com docker compose --profile https up -d" >&2; exit 1; };
+      exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

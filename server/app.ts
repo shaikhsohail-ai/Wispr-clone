@@ -147,11 +147,17 @@ function hostnameOf(value: string): string | null {
  * has to use a DNS name, so IP literals stay open for LAN use with HOST=0.0.0.0.
  *
  * With a password configured the Host check is unnecessary (a rebinding page cannot present the credentials,
- * which the browser only attaches for the origin that supplied them), so any host name is accepted and a
- * deployment needs no host list. The Origin check stays: a cross-site page is refused even if it could
- * somehow carry credentials.
+ * which the browser only attaches for the origin that supplied them), so any host name is accepted. The Origin
+ * check stays: a cross-site page is refused even if it could somehow carry credentials. It compares the Origin
+ * with the Host the server sees, so a reverse proxy must pass the original Host header through (the bundled
+ * Caddy, cloudflared and the hosting platforms do); one that rewrites it to the upstream address needs the public
+ * name in WISPR_ALLOWED_HOSTS instead. X-Forwarded-Host is deliberately not trusted: without a proxy it is
+ * whatever the client sends.
+ *
+ * Rejections are logged once per message: the app polls every few seconds while it is refused, and a 403 is
+ * otherwise invisible in platform logs when a deployment is misconfigured.
  */
-function createHostGuard(allowedHosts: string[], passwordProtected: boolean) {
+function createHostGuard(allowedHosts: string[], passwordProtected: boolean, log: (line: string) => void = console.warn) {
   const allowed = (hostname: string | null): boolean => {
     if (!hostname) return false;
     const name = hostname.toLowerCase();
@@ -159,16 +165,23 @@ function createHostGuard(allowedHosts: string[], passwordProtected: boolean) {
     if (isIP(name.replace(/^\[|\]$/g, ''))) return true;
     return allowedHosts.some((entry) => (entry.startsWith('.') ? name === entry.slice(1) || name.endsWith(entry) : name === entry));
   };
+  const reported = new Set<string>();
+  const reject = (next: NextFunction, message: string, code: string) => {
+    if (!reported.has(message)) {
+      if (reported.size >= 100) reported.clear();
+      reported.add(message);
+      log(`[api] 403 ${message}`);
+    }
+    next(new HttpError(403, message, code));
+  };
   return (req: Request, _res: Response, next: NextFunction) => {
     const host = req.headers.host ?? '';
     const hostName = hostnameOf(host);
     if (!passwordProtected && !allowed(hostName)) {
-      return next(
-        new HttpError(
-          403,
-          `Requests for host "${host}" are not accepted; set WISPR_PASSWORD or add it to WISPR_ALLOWED_HOSTS`,
-          'forbidden_host',
-        ),
+      return reject(
+        next,
+        `Requests for host "${host}" are not accepted; set WISPR_PASSWORD or add it to WISPR_ALLOWED_HOSTS`,
+        'forbidden_host',
       );
     }
     const origin = req.headers.origin;
@@ -176,7 +189,11 @@ function createHostGuard(allowedHosts: string[], passwordProtected: boolean) {
       const originName = hostnameOf(origin);
       const sameSite = originName !== null && hostName !== null && originName.toLowerCase() === hostName.toLowerCase();
       if (!sameSite && !allowed(originName)) {
-        return next(new HttpError(403, `Requests from origin "${origin}" are not accepted`, 'forbidden_origin'));
+        return reject(
+          next,
+          `Requests from origin "${origin}" are not accepted for host "${host}"; make the proxy pass the original Host header through, or add the origin's host name to WISPR_ALLOWED_HOSTS`,
+          'forbidden_origin',
+        );
       }
     }
     next();
@@ -190,7 +207,13 @@ export function createApp(deps: AppDeps): express.Express {
   app.set('etag', false);
 
   if (config.password) {
-    app.use(createBasicAuth({ username: config.username, password: config.password, open: ['/api/health'] }));
+    app.use(
+      createBasicAuth({
+        username: config.username,
+        password: config.password,
+        open: ['/api/health', '/manifest.webmanifest', '/icon.svg'],
+      }),
+    );
   }
 
   const api = express.Router();
@@ -198,6 +221,13 @@ export function createApp(deps: AppDeps): express.Express {
   api.use(express.json({ limit: '2mb' }));
 
   api.get('/health', (_req, res) => {
+    // A platform probe only needs "ok". Which paid API keys are configured is worth knowing to someone deciding
+    // whether to guess the password, so the details are kept for the signed-in app.
+    if (config.password && !res.locals.authenticated) {
+      const probe: HealthInfo = { ok: true };
+      res.json(probe);
+      return;
+    }
     const health: HealthInfo = {
       ok: true,
       version: deps.version,

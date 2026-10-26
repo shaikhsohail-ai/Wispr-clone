@@ -57,13 +57,14 @@ export interface Stats {
   timeSavedMs: number;
 }
 
+/** `/api/health`. With a password configured, a caller without it only gets `ok`; the details are for the signed-in app. */
 export interface HealthInfo {
   ok: true;
-  version: string;
-  engines: Record<Exclude<EngineId, 'webspeech'>, boolean>;
-  localModel: string;
-  polish: boolean;
-  polishModel: string;
+  version?: string;
+  engines?: Record<Exclude<EngineId, 'webspeech'>, boolean>;
+  localModel?: string;
+  polish?: boolean;
+  polishModel?: string;
 }
 
 export interface TranscribeResult {
